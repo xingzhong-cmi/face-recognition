@@ -1,0 +1,22 @@
+# ============================================================
+# 项目依赖列表
+# ============================================================
+# 安装命令：
+#   pip install -r requirements.txt
+#
+# 国内用户如下载缓慢，可使用清华镜像：
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# ============================================================
+
+# PyTorch 主框架
+torch>=2.0.0
+# 提供 ResNet 等预训练视觉模型
+torchvision>=0.15.0
+# 提供 MTCNN 人脸检测器（也包含 FaceNet 等预训练人脸模型）
+facenet-pytorch>=2.5.3
+# OpenCV：摄像头采集与画框显示
+opencv-python>=4.8.0
+# 数值计算
+numpy>=1.24.0
+# 图像读写
+Pillow>=10.0.0

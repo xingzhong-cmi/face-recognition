@@ -1,0 +1,32 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+
+# ===== 打包与构建 =====
+build/
+dist/
+*.egg-info/
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ===== 项目相关 =====
+# 生成的人脸库二进制文件
+data/face_db.pt
+# 用户自己的人脸照片（避免隐私数据被提交）
+data/known_faces/*
+!data/known_faces/.gitkeep
+
+# torch hub / torchvision 下载的预训练权重缓存
+.cache/
+*.pth
