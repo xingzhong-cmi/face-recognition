@@ -16,24 +16,28 @@ face_database.py
 
 每个一级子目录的名字即为该人员的姓名（label），目录下放该人的
 若干张正脸照片即可。运行 ``register.py`` 后会在 ``data/face_db.pt``
-生成一个二进制文件，里面是字典：
+生成一个二进制文件，默认格式为：
 
     {
-        "alice": Tensor(N1, D),   # N1 张图，每张 D 维 embedding
-        "bob":   Tensor(N2, D),
-        ...
+        "version": 2,
+        "embedding_size": 512,
+        "embeddings": {
+            "alice": Tensor(N1, D),
+            "bob":   Tensor(N2, D),
+            ...
+        }
     }
 """
 
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from facenet_pytorch import MTCNN
-from torchvision.transforms.functional import to_pil_image
 
-from model import FaceResNet, face_transform, get_device
+from model import FACE_EMBEDDING_SIZE, get_device, get_face_encoder
 
 
 class FaceDatabase:
@@ -45,20 +49,17 @@ class FaceDatabase:
         已注册人员图片所在的根目录。
     db_path : str
         生成的人脸库 (.pt) 文件保存路径。
-    embedding_size : int
-        embedding 的维度，需与 ``FaceResNet`` 保持一致。
-    backbone : str
-        "resnet18" 或 "resnet50"。
     """
+    DB_VERSION = 2
 
     def __init__(self,
                  data_dir: str = "data/known_faces",
-                 db_path: str = "data/face_db.pt",
-                 embedding_size: int = 128,
-                 backbone: str = "resnet18"):
+                 db_path: str = "data/face_db.pt"):
         self.data_dir = Path(data_dir)
         self.db_path = Path(db_path)
         self.device = get_device()
+        self.embedding_size = FACE_EMBEDDING_SIZE
+        self.db_version = self.DB_VERSION
 
         # ---------- 人脸检测器 ----------
         # MTCNN 会从原图中找到人脸，并裁剪到 image_size 大小。
@@ -71,10 +72,7 @@ class FaceDatabase:
                            device=self.device)
 
         # ---------- 特征提取器 ----------
-        self.model = FaceResNet(embedding_size=embedding_size,
-                                backbone=backbone).to(self.device)
-        # 没有训练阶段，直接 eval 即可（关闭 dropout/bn 更新）
-        self.model.eval()
+        self.model = get_face_encoder(self.device)
 
         # 已注册人脸库：name -> Tensor(N, D)
         self.embeddings: Dict[str, torch.Tensor] = {}
@@ -84,7 +82,7 @@ class FaceDatabase:
     # ==================================================================
     @torch.no_grad()
     def _extract_embedding(self, pil_image: Image.Image) -> Optional[torch.Tensor]:
-        """先用 MTCNN 检测并裁剪人脸，再用 ResNet 提取 embedding。
+        """先用 MTCNN 检测并裁剪人脸，再提取 embedding。
 
         Returns
         -------
@@ -96,11 +94,8 @@ class FaceDatabase:
         if face is None:
             return None
 
-        # 反归一化到 [0, 1]，再走自己的 transform 走一次标准化，
-        # 这样和实时识别阶段使用的预处理完全一致。
-        face_img = (face.clamp(-1, 1) + 1) / 2  # [-1,1] -> [0,1]
-        pil_face = to_pil_image(face_img)
-        tensor = face_transform(pil_face).unsqueeze(0).to(self.device)
+        # InceptionResnetV1 直接吃 MTCNN 输出，无需二次标准化。
+        tensor = face.unsqueeze(0).to(self.device)  # (1, 3, 160, 160)
 
         emb = self.model(tensor).squeeze(0).cpu()  # (D,)
         return emb
@@ -154,7 +149,12 @@ class FaceDatabase:
     def save(self) -> None:
         """把人脸库序列化到磁盘。"""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.embeddings, self.db_path)
+        payload = {
+            "version": self.DB_VERSION,
+            "embedding_size": self.embedding_size,
+            "embeddings": self.embeddings,
+        }
+        torch.save(payload, self.db_path)
         print(f"人脸库已保存到: {self.db_path}")
 
     def load(self) -> bool:
@@ -167,11 +167,33 @@ class FaceDatabase:
             False : 文件不存在
         """
         if self.db_path.exists():
-            # weights_only=False 是因为我们存的是 dict，不是模型权重
-            self.embeddings = torch.load(self.db_path, map_location="cpu")
+            payload: Any = torch.load(self.db_path, map_location="cpu")
+            if isinstance(payload, dict) and "embeddings" in payload:
+                self.db_version = int(payload.get("version", 0))
+                self.embedding_size = int(payload.get("embedding_size", 0))
+                self.embeddings = payload.get("embeddings", {})
+                if not isinstance(self.embeddings, dict):
+                    raise ValueError(f"人脸库格式不支持: {self.db_path}")
+            elif isinstance(payload, dict) and all(
+                    isinstance(v, torch.Tensor) for v in payload.values()):
+                # 兼容旧格式：{name: Tensor(N, 128)}
+                self.db_version = 1
+                self.embeddings = payload
+                if self.embeddings:
+                    first = next(iter(self.embeddings.values()))
+                    self.embedding_size = int(first.shape[-1])
+            else:
+                raise ValueError(f"人脸库格式不支持: {self.db_path}")
             print(f"已加载人脸库: {self.db_path}，共 {len(self.embeddings)} 人")
             return True
         return False
+
+    def is_compatible(self) -> bool:
+        """当前加载的人脸库是否与新版编码器兼容。"""
+        return (
+            self.db_version >= self.DB_VERSION
+            and self.embedding_size == FACE_EMBEDDING_SIZE
+        )
 
     # ==================================================================
     # 识别
@@ -179,13 +201,13 @@ class FaceDatabase:
     @torch.no_grad()
     def identify(self,
                  face_tensor: torch.Tensor,
-                 threshold: float = 0.6) -> Tuple[str, float]:
-        """对一张已经裁剪 + 标准化好的人脸，做身份识别。
+                 threshold: float = 0.7) -> Tuple[str, float]:
+        """对一张已经裁剪好的人脸，做身份识别。
 
         Parameters
         ----------
         face_tensor : torch.Tensor
-            形状 (3, H, W)，由 face_transform 处理过的张量。
+            形状 (3, 160, 160) 的人脸张量（MTCNN 输出，范围约 [-1, 1]）。
         threshold : float
             余弦相似度阈值；最佳匹配低于该值则返回 "Unknown"。
             该阈值需要根据实际场景微调，常见范围 0.5 ~ 0.8。
@@ -206,14 +228,26 @@ class FaceDatabase:
         # 在所有已注册人员中找余弦相似度最高的
         best_name = "Unknown"
         best_score = -1.0
+        has_valid_match = False
         for name, embs in self.embeddings.items():
+            if embs.ndim != 2 or embs.shape[1] != query.shape[0]:
+                print(f"[WARN] 跳过维度不匹配的人脸数据: {name}")
+                continue
+            has_valid_match = True
             # embs: (N, D), query: (D,)
             # 由于 query / embs 都已经 L2 归一化，矩阵乘积即为余弦相似度
-            scores = embs @ query                # (N,)
-            score = scores.max().item()          # 取该人多张照片中的最高分
+            scores = embs @ query                      # (N,)
+            max_score = scores.max().item()            # 多照片最高分
+            # 均值向量可降低单张异常照片影响，max_score 可保留最优匹配能力。
+            mean_emb = F.normalize(embs.mean(dim=0), p=2, dim=0)
+            mean_score = torch.dot(mean_emb, query).item()
+            score = max(max_score, mean_score)
             if score > best_score:
                 best_score = score
                 best_name = name
+
+        if not has_valid_match:
+            return "Unknown", 0.0
 
         # 低于阈值认为是陌生人
         if best_score < threshold:

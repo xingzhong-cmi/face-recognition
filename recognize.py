@@ -7,13 +7,13 @@ recognize.py
 ----
   1. 用 OpenCV 打开笔记本摄像头
   2. 每一帧（或每 N 帧）用 MTCNN 检测所有人脸
-  3. 对每张人脸用 ResNet 提取 embedding，并在人脸库中找最相似的人
+  3. 对每张人脸用 InceptionResnetV1 提取 embedding，并在人脸库中找最相似的人
   4. 用 OpenCV 绘制人脸框 + 姓名 + 相似度
   5. 按 'q' 退出
 
 使用方法
 --------
-    python recognize.py                          # 默认摄像头 0，阈值 0.6
+    python recognize.py                          # 默认摄像头 0，阈值 0.7
     python recognize.py --camera 1               # 使用外接摄像头
     python recognize.py --threshold 0.7          # 收紧识别阈值
     python recognize.py --detect-every 2         # 每 2 帧检测一次 (省 CPU)
@@ -26,10 +26,9 @@ import cv2
 import torch  # noqa: F401  # 让 torch 提前初始化，避免首帧延迟过大
 from PIL import Image
 from facenet_pytorch import MTCNN
-from torchvision.transforms.functional import to_pil_image
 
 from face_database import FaceDatabase
-from model import face_transform, get_device
+from model import FACE_EMBEDDING_SIZE, get_device
 
 
 # ----------------------------------------------------------------------
@@ -66,10 +65,12 @@ def draw_box(frame, box, label: str, color=(0, 255, 0)) -> None:
 # ----------------------------------------------------------------------
 def main() -> None:
     # ----- 命令行参数 -----
-    parser = argparse.ArgumentParser(description="基于 PyTorch+ResNet 的实时人脸识别")
+    parser = argparse.ArgumentParser(
+        description="基于 PyTorch+InceptionResnetV1 的实时人脸识别"
+    )
     parser.add_argument("--camera", type=int, default=0,
                         help="摄像头索引；笔记本内置一般为 0，外接 USB 摄像头通常为 1")
-    parser.add_argument("--threshold", type=float, default=0.6,
+    parser.add_argument("--threshold", type=float, default=0.7,
                         help="余弦相似度阈值，低于该值则判为 Unknown；越大越严格")
     parser.add_argument("--detect-every", type=int, default=1,
                         help="每 N 帧执行一次检测+识别；CPU 卡顿时可调大")
@@ -84,9 +85,19 @@ def main() -> None:
     if not db.load():
         print("[ERROR] 未找到人脸库 (data/face_db.pt)，请先运行: python register.py")
         return
+    if not db.is_compatible():
+        print("[ERROR] 检测到旧版本人脸库：data/face_db.pt")
+        print("[ERROR] 该文件与当前 VGGFace2(512维) 编码器不兼容。")
+        print("[ERROR] 请删除旧库后重新运行：python register.py")
+        return
     if not db.embeddings:
         print("[ERROR] 人脸库为空，请先在 data/known_faces/ 下添加图片并运行 register.py")
         return
+    for name, embs in db.embeddings.items():
+        if embs.ndim != 2 or embs.shape[1] != FACE_EMBEDDING_SIZE:
+            print(f"[ERROR] 人脸库中 {name} 的特征维度异常（期望 {FACE_EMBEDDING_SIZE} 维）。")
+            print("[ERROR] 请重新运行：python register.py")
+            return
 
     # ----- 多人脸检测器 -----
     # 这里 keep_all=True，表示一帧里可能有多张脸，全部返回。
@@ -128,13 +139,12 @@ def main() -> None:
 
             results = []
             if boxes is not None and faces is not None:
+                # keep_all=True 时通常是 (N, 3, 160, 160)；单脸场景做兼容兜底。
+                if faces.ndim == 3:
+                    faces = faces.unsqueeze(0)
                 for box, face in zip(boxes, faces):
-                    # MTCNN 输出范围约 [-1, 1]，反归一化回 [0, 1] -> PIL
-                    # 再走我们自己的 face_transform，确保和注册阶段一致
-                    face_img = (face.clamp(-1, 1) + 1) / 2
-                    pil_face = to_pil_image(face_img)
-                    tensor = face_transform(pil_face)
-                    name, score = db.identify(tensor, threshold=args.threshold)
+                    # 直接使用 MTCNN 输出（范围约 [-1, 1]）
+                    name, score = db.identify(face, threshold=args.threshold)
                     results.append((box, name, score))
             last_results = results
 

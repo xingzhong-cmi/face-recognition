@@ -16,16 +16,47 @@ register.py
 
 注意
 ----
-首次运行会自动下载 ResNet 与 MTCNN 的预训练权重，需要联网。
+首次运行会自动下载 InceptionResnetV1 与 MTCNN 的预训练权重，需要联网。
 """
 
+from pathlib import Path
+
+import torch
+from pickle import UnpicklingError
+
 from face_database import FaceDatabase
+from model import FACE_EMBEDDING_SIZE
+
+
+def _is_legacy_face_db(db_path: Path) -> bool:
+    """检测当前 face_db.pt 是否为旧版本格式或旧维度。"""
+    if not db_path.exists():
+        return False
+
+    try:
+        payload = torch.load(db_path, map_location="cpu")
+    except (RuntimeError, UnpicklingError, EOFError, ValueError):
+        # 文件损坏/不可读也按不兼容处理，后续重建会覆盖。
+        return True
+
+    if isinstance(payload, dict) and "embeddings" in payload:
+        return (
+            int(payload.get("version", 0)) < FaceDatabase.DB_VERSION
+            or int(payload.get("embedding_size", 0)) != FACE_EMBEDDING_SIZE
+        )
+
+    # 旧格式：{name: Tensor(N, 128)}
+    return True
 
 
 def main() -> None:
     print("=" * 60)
     print("开始构建人脸库 ...")
     print("=" * 60)
+
+    db_path = Path("data/face_db.pt")
+    if _is_legacy_face_db(db_path):
+        print("[INFO] 检测到旧版本人脸库，将重新构建。")
 
     db = FaceDatabase()
     db.build()
