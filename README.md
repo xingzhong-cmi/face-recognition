@@ -1,4 +1,4 @@
-# 基于 PyTorch + InceptionResnetV1 的实时人脸识别
+# 基于 PyTorch + InceptionResnetV1 的实时人脸识别2
 
 一个简洁的人脸识别小项目：
 
